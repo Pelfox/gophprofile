@@ -110,11 +110,16 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 func newRouter(avatarsController *controllers.AvatarsController) http.Handler {
 	router := chi.NewRouter()
 
+	// Adding Prometheus request metrics before route handlers run.
+	router.Use(observability.HTTPMetricsMiddleware)
+
 	// Adding tracing middleware via OpenTelemetry.
 	router.Use(func(next http.Handler) http.Handler {
 		return otelhttp.NewHandler(next, "http.server")
 	})
 
+	// Exposing process and custom application metrics for Prometheus.
+	router.Handle("/metrics", observability.MetricsHandler())
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})

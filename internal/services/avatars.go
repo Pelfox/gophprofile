@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/models"
+	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/storage"
@@ -25,6 +26,29 @@ import (
 )
 
 const maxFileSize = 10485760 // 10 MiB
+
+const (
+	// Avatar upload metric results describe the step where the upload workflow ended.
+	avatarUploadResultSuccess       = observability.MetricsResultSuccess
+	avatarUploadResultFileTooLarge  = "file_too_large"
+	avatarUploadResultInvalidFile   = "invalid_file"
+	avatarUploadResultUnsupported   = "unsupported_file"
+	avatarUploadResultDBError       = "db_error"
+	avatarUploadResultStorageError  = "storage_error"
+	avatarUploadResultQueueError    = "queue_error"
+	avatarUploadResultInternalError = "internal_error"
+
+	// Avatar processing metric statuses describe queueing and resize completion transitions.
+	avatarProcessingStatusQueued    = "queued"
+	avatarProcessingStatusCompleted = "completed"
+	avatarProcessingStatusFailed    = "failed"
+
+	// Avatar deletion metric results describe the final outcome of a delete request.
+	avatarDeletionResultSuccess   = observability.MetricsResultSuccess
+	avatarDeletionResultNotFound  = "not_found"
+	avatarDeletionResultForbidden = "forbidden"
+	avatarDeletionResultError     = observability.MetricsResultError
+)
 
 var tracer = otel.Tracer("github.com/pelfox/gophprofile/internal/services")
 
@@ -232,12 +256,19 @@ func (s *avatarsService) Create(
 	)
 	defer span.End()
 
+	uploadResult := avatarUploadResultSuccess
+	defer func() {
+		observability.RecordAvatarUpload(uploadResult, input.Header.Size)
+	}()
+
 	if input.Header.Size > maxFileSize {
+		uploadResult = avatarUploadResultFileTooLarge
 		return nil, ErrFileTooLarge
 	}
 
 	bytes, err := io.ReadAll(input.File)
 	if err != nil {
+		uploadResult = avatarUploadResultInvalidFile
 		recordServiceError(span, err)
 		s.logger.Error().Err(err).Msg("failed to read the file")
 		return nil, ErrInvalidFile
@@ -245,11 +276,13 @@ func (s *avatarsService) Create(
 
 	mimeType := http.DetectContentType(bytes)
 	if !slices.Contains(supportedMimeTypes, mimeType) {
+		uploadResult = avatarUploadResultUnsupported
 		return nil, ErrUnsupportedFile
 	}
 
 	fileID, err := uuid.NewV7()
 	if err != nil {
+		uploadResult = avatarUploadResultInternalError
 		recordServiceError(span, err)
 		s.logger.Error().Err(err).Msg("failed to create a new file ID")
 		return nil, ErrUploadFailed
@@ -266,6 +299,7 @@ func (s *avatarsService) Create(
 		S3Key:     fileName,
 	})
 	if err != nil {
+		uploadResult = avatarUploadResultDBError
 		recordServiceError(span, err)
 		s.logger.Error().Err(err).Msg("failed to create a new avatar")
 		return nil, ErrUploadFailed
@@ -278,6 +312,7 @@ func (s *avatarsService) Create(
 		models.UploadStatusUploading,
 	)
 	if err != nil {
+		uploadResult = avatarUploadResultDBError
 		recordServiceError(span, err)
 		logger.Error().Err(err).Msg("failed to update upload status")
 		return nil, ErrUploadFailed
@@ -294,11 +329,13 @@ func (s *avatarsService) Create(
 		storeErr := err
 		_, statusErr := s.updateUploadStatus(ctx, avatar.ID, models.UploadStatusFailed)
 		if statusErr != nil {
+			uploadResult = avatarUploadResultDBError
 			recordServiceError(span, statusErr)
 			logger.Error().Err(statusErr).Msg("failed to update upload status")
 			return nil, ErrUploadFailed
 		}
 
+		uploadResult = avatarUploadResultStorageError
 		recordServiceError(span, storeErr)
 		logger.Error().Err(storeErr).Msg("failed to upload avatar to S3")
 		return nil, ErrUploadFailed
@@ -310,6 +347,7 @@ func (s *avatarsService) Create(
 		models.UploadStatusCompleted,
 	)
 	if err != nil {
+		uploadResult = avatarUploadResultDBError
 		recordServiceError(span, err)
 		logger.Error().Err(err).Msg("failed to update upload status")
 		return nil, ErrUploadFailed
@@ -324,6 +362,7 @@ func (s *avatarsService) Create(
 		},
 	)
 	if err != nil {
+		uploadResult = avatarUploadResultDBError
 		recordServiceError(span, err)
 		logger.Error().Err(err).Msg("failed to update processing status")
 		return nil, ErrUploadFailed
@@ -336,6 +375,7 @@ func (s *avatarsService) Create(
 		Key:      fileKey,
 	})
 	if queueErr != nil {
+		uploadResult = avatarUploadResultQueueError
 		newProcessingStatus := models.ProcessingStatusFailed
 		avatar, err = s.avatarsRepository.Update(
 			ctx,
@@ -350,10 +390,12 @@ func (s *avatarsService) Create(
 			return nil, ErrUploadFailed
 		}
 
+		observability.RecordAvatarProcessing(avatarProcessingStatusFailed)
 		recordServiceError(span, queueErr)
 		logger.Error().Err(queueErr).Msg("failed to queue file resize")
 		return nil, ErrUploadFailed
 	}
+	observability.RecordAvatarProcessing(avatarProcessingStatusQueued)
 	logger.Info().Msg("queued file resize job")
 
 	response := CreateAvatarResult{
@@ -494,20 +536,28 @@ func (s *avatarsService) DeleteByID(
 	)
 	defer span.End()
 
+	deletionResult := avatarDeletionResultSuccess
+	defer func() {
+		observability.RecordAvatarDeletion(deletionResult)
+	}()
+
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
+			deletionResult = avatarDeletionResultNotFound
 			return ErrAvatarNotFound
 		}
 		s.logger.Error().Err(err).
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to retrieve avatar")
+		deletionResult = avatarDeletionResultError
 		recordServiceError(span, err)
 		return ErrAvatarQueryFailed
 	}
 
 	if avatar.UserID != userID {
+		deletionResult = avatarDeletionResultForbidden
 		return ErrAvatarDeletionForbidden
 	}
 
@@ -516,6 +566,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to delete avatar")
+		deletionResult = avatarDeletionResultError
 		recordServiceError(span, err)
 		return ErrAvatarDeletionFailed
 	}
@@ -528,6 +579,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to queue avatar storage deletion")
+		deletionResult = avatarDeletionResultError
 		recordServiceError(span, err)
 		return ErrAvatarDeletionFailed
 	}
@@ -562,16 +614,19 @@ func (s *avatarsService) CompleteResize(
 	)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
+			observability.RecordAvatarProcessing(avatarProcessingStatusFailed)
 			return ErrAvatarNotFound
 		}
 
 		s.logger.Error().Err(err).
 			Str("avatar_id", message.ID.String()).
 			Msg("failed to complete avatar resize")
+		observability.RecordAvatarProcessing(avatarProcessingStatusFailed)
 		recordServiceError(span, err)
 		return ErrUploadFailed
 	}
 
+	observability.RecordAvatarProcessing(avatarProcessingStatusCompleted)
 	return nil
 }
 

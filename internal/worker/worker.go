@@ -10,6 +10,7 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"path"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/config"
@@ -28,6 +29,13 @@ const (
 	consumerPrefetch     = 1
 	thumbnailContentType = "image/jpeg"
 	thumbnailQuality     = 90
+
+	// Worker metric label values are intentionally low-cardinality.
+	workerJobResize         = "resize"
+	workerJobDelete         = "delete"
+	workerJobResultSuccess  = observability.MetricsResultSuccess
+	workerJobResultError    = observability.MetricsResultError
+	workerJobResultAckError = "ack_error"
 )
 
 type thumbnailSize struct {
@@ -146,7 +154,13 @@ func consumeQueues(
 				observability.AMQPHeaderCarrier(delivery.Headers),
 			)
 
+			jobStart := time.Now()
 			if err := processor.processResize(deliveryCtx, delivery.Body); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobResize,
+					workerJobResultError,
+					time.Since(jobStart),
+				)
 				logger.Error().Err(err).Msg("failed to process resize job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
@@ -155,8 +169,18 @@ func consumeQueues(
 			}
 
 			if err := delivery.Ack(false); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobResize,
+					workerJobResultAckError,
+					time.Since(jobStart),
+				)
 				return fmt.Errorf("failed to acknowledge resize job: %w", err)
 			}
+			observability.ObserveWorkerJob(
+				workerJobResize,
+				workerJobResultSuccess,
+				time.Since(jobStart),
+			)
 		case delivery, ok := <-deleteDeliveries:
 			if !ok {
 				return errors.New("delete queue consumer closed")
@@ -167,7 +191,13 @@ func consumeQueues(
 				observability.AMQPHeaderCarrier(delivery.Headers),
 			)
 
+			jobStart := time.Now()
 			if err := processor.processDelete(deliveryCtx, delivery.Body); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobDelete,
+					workerJobResultError,
+					time.Since(jobStart),
+				)
 				logger.Error().Err(err).Msg("failed to process delete job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
@@ -176,8 +206,18 @@ func consumeQueues(
 			}
 
 			if err := delivery.Ack(false); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobDelete,
+					workerJobResultAckError,
+					time.Since(jobStart),
+				)
 				return fmt.Errorf("failed to acknowledge delete job: %w", err)
 			}
+			observability.ObserveWorkerJob(
+				workerJobDelete,
+				workerJobResultSuccess,
+				time.Since(jobStart),
+			)
 		}
 	}
 }

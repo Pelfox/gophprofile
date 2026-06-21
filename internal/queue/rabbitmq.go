@@ -86,6 +86,12 @@ func (r *rabbitMQQueue) publish(
 	queueName string,
 	message any,
 ) error {
+	// Recording publish attempts here covers all queue-specific methods.
+	publishResult := observability.MetricsResultSuccess
+	defer func() {
+		observability.RecordQueuePublish(queueName, publishResult)
+	}()
+
 	// Creating headers for OpenTelemetry to place trace info into.
 	headers := amqp.Table{}
 	otel.GetTextMapPropagator().Inject(
@@ -95,10 +101,12 @@ func (r *rabbitMQQueue) publish(
 
 	body, err := json.Marshal(message)
 	if err != nil {
+		publishResult = observability.MetricsResultError
 		return fmt.Errorf("failed to marshal request message: %w", err)
 	}
 	queue, ok := r.queues[queueName]
 	if !ok {
+		publishResult = observability.MetricsResultError
 		return fmt.Errorf("unknown queue: %s", queueName)
 	}
 
@@ -121,6 +129,7 @@ func (r *rabbitMQQueue) publish(
 		publishing,
 	)
 	if err != nil {
+		publishResult = observability.MetricsResultError
 		return fmt.Errorf("failed to publish request message: %w", err)
 	}
 

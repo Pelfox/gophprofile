@@ -87,6 +87,7 @@ type avatarsRepository struct {
 	sq   squirrel.StatementBuilderType
 }
 
+// startDatabaseSpan creates a repository span with common PostgreSQL attributes.
 func startDatabaseSpan(
 	ctx context.Context,
 	name string,
@@ -105,6 +106,8 @@ func startDatabaseSpan(
 	return tracer.Start(ctx, name, trace.WithAttributes(baseAttrs...))
 }
 
+// recordDatabaseError marks a span as failed for driver or scan errors.
+// pgx.ErrNoRows is a valid query result and is translated to a domain error.
 func recordDatabaseError(span trace.Span, err error) {
 	if err == nil || errors.Is(err, pgx.ErrNoRows) {
 		return
