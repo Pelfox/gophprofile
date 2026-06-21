@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/controllers"
+	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/services"
@@ -22,6 +23,8 @@ import (
 	"github.com/pelfox/gophprofile/pkg"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -106,6 +109,12 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 
 func newRouter(avatarsController *controllers.AvatarsController) http.Handler {
 	router := chi.NewRouter()
+
+	// Adding tracing middleware via OpenTelemetry.
+	router.Use(func(next http.Handler) http.Handler {
+		return otelhttp.NewHandler(next, "http.server")
+	})
+
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})
@@ -171,6 +180,11 @@ func consumeResizeDoneQueue(
 				return errors.New("resize completion consumer closed")
 			}
 
+			deliveryCtx := otel.GetTextMapPropagator().Extract(
+				ctx,
+				observability.AMQPHeaderCarrier(delivery.Headers),
+			)
+
 			var message pkg.MessageResizeDone
 			if err := json.Unmarshal(delivery.Body, &message); err != nil {
 				logger.Error().Err(err).Msg("failed to unmarshal resize done message")
@@ -180,7 +194,7 @@ func consumeResizeDoneQueue(
 				continue
 			}
 
-			if err := avatarsService.CompleteResize(ctx, message); err != nil {
+			if err := avatarsService.CompleteResize(deliveryCtx, message); err != nil {
 				logger.Error().Err(err).Msg("failed to complete avatar resize")
 				requeue := !errors.Is(err, services.ErrAvatarNotFound)
 				if err := delivery.Nack(false, requeue); err != nil {

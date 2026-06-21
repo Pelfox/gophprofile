@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/pkg"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel"
 )
 
 type rabbitMQQueue struct {
@@ -84,6 +86,13 @@ func (r *rabbitMQQueue) publish(
 	queueName string,
 	message any,
 ) error {
+	// Creating headers for OpenTelemetry to place trace info into.
+	headers := amqp.Table{}
+	otel.GetTextMapPropagator().Inject(
+		ctx,
+		observability.AMQPHeaderCarrier(headers),
+	)
+
 	body, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request message: %w", err)
@@ -97,6 +106,7 @@ func (r *rabbitMQQueue) publish(
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		Body:         body,
+		Headers:      headers,
 	}
 
 	r.mu.Lock()

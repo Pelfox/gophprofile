@@ -13,11 +13,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/config"
+	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
@@ -139,7 +141,12 @@ func consumeQueues(
 				return errors.New("resize queue consumer closed")
 			}
 
-			if err := processor.processResize(ctx, delivery.Body); err != nil {
+			deliveryCtx := otel.GetTextMapPropagator().Extract(
+				ctx,
+				observability.AMQPHeaderCarrier(delivery.Headers),
+			)
+
+			if err := processor.processResize(deliveryCtx, delivery.Body); err != nil {
 				logger.Error().Err(err).Msg("failed to process resize job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
@@ -155,7 +162,12 @@ func consumeQueues(
 				return errors.New("delete queue consumer closed")
 			}
 
-			if err := processor.processDelete(ctx, delivery.Body); err != nil {
+			deliveryCtx := otel.GetTextMapPropagator().Extract(
+				ctx,
+				observability.AMQPHeaderCarrier(delivery.Headers),
+			)
+
+			if err := processor.processDelete(deliveryCtx, delivery.Body); err != nil {
 				logger.Error().Err(err).Msg("failed to process delete job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
