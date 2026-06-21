@@ -21,11 +21,29 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const maxFileSize = 10485760 // 10 MiB
 
 var tracer = otel.Tracer("github.com/pelfox/gophprofile/internal/services")
+
+func startServiceSpan(
+	ctx context.Context,
+	name string,
+	attrs ...attribute.KeyValue,
+) (context.Context, trace.Span) {
+	return tracer.Start(ctx, name, trace.WithAttributes(attrs...))
+}
+
+func recordServiceError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}
 
 var (
 	// ErrFileTooLarge is returned when the file exceeds the upload size limit.
@@ -205,14 +223,14 @@ func (s *avatarsService) Create(
 	userID uuid.UUID,
 	input CreateAvatarInput,
 ) (*CreateAvatarResult, error) {
-	ctx, span := tracer.Start(ctx, "avatars.create")
-	defer span.End()
-
-	span.SetAttributes(
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.create",
 		attribute.String("user.id", userID.String()),
 		attribute.Int64("avatar.file.size", input.Header.Size),
 		attribute.String("avatar.file.name", input.Header.Filename),
 	)
+	defer span.End()
 
 	if input.Header.Size > maxFileSize {
 		return nil, ErrFileTooLarge
@@ -220,8 +238,7 @@ func (s *avatarsService) Create(
 
 	bytes, err := io.ReadAll(input.File)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		s.logger.Error().Err(err).Msg("failed to read the file")
 		return nil, ErrInvalidFile
 	}
@@ -233,8 +250,7 @@ func (s *avatarsService) Create(
 
 	fileID, err := uuid.NewV7()
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		s.logger.Error().Err(err).Msg("failed to create a new file ID")
 		return nil, ErrUploadFailed
 	}
@@ -250,8 +266,7 @@ func (s *avatarsService) Create(
 		S3Key:     fileName,
 	})
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		s.logger.Error().Err(err).Msg("failed to create a new avatar")
 		return nil, ErrUploadFailed
 	}
@@ -263,8 +278,7 @@ func (s *avatarsService) Create(
 		models.UploadStatusUploading,
 	)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		logger.Error().Err(err).Msg("failed to update upload status")
 		return nil, ErrUploadFailed
 	}
@@ -280,14 +294,12 @@ func (s *avatarsService) Create(
 		storeErr := err
 		_, statusErr := s.updateUploadStatus(ctx, avatar.ID, models.UploadStatusFailed)
 		if statusErr != nil {
-			span.RecordError(statusErr)
-			span.SetStatus(codes.Error, statusErr.Error())
+			recordServiceError(span, statusErr)
 			logger.Error().Err(statusErr).Msg("failed to update upload status")
 			return nil, ErrUploadFailed
 		}
 
-		span.RecordError(storeErr)
-		span.SetStatus(codes.Error, storeErr.Error())
+		recordServiceError(span, storeErr)
 		logger.Error().Err(storeErr).Msg("failed to upload avatar to S3")
 		return nil, ErrUploadFailed
 	}
@@ -298,8 +310,7 @@ func (s *avatarsService) Create(
 		models.UploadStatusCompleted,
 	)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		logger.Error().Err(err).Msg("failed to update upload status")
 		return nil, ErrUploadFailed
 	}
@@ -313,8 +324,7 @@ func (s *avatarsService) Create(
 		},
 	)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		logger.Error().Err(err).Msg("failed to update processing status")
 		return nil, ErrUploadFailed
 	}
@@ -335,14 +345,12 @@ func (s *avatarsService) Create(
 			},
 		)
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+			recordServiceError(span, err)
 			logger.Error().Err(err).Msg("failed to update processing status")
 			return nil, ErrUploadFailed
 		}
 
-		span.RecordError(queueErr)
-		span.SetStatus(codes.Error, queueErr.Error())
+		recordServiceError(span, queueErr)
 		logger.Error().Err(queueErr).Msg("failed to queue file resize")
 		return nil, ErrUploadFailed
 	}
@@ -367,9 +375,12 @@ func (s *avatarsService) GetByID(
 	ctx context.Context,
 	id uuid.UUID,
 ) (string, []byte, error) {
-	ctx, span := tracer.Start(ctx, "avatars.get_by_id")
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.get_by_id",
+		attribute.String("id", id.String()),
+	)
 	defer span.End()
-	span.SetAttributes(attribute.String("id", id.String()))
 
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
@@ -379,8 +390,7 @@ func (s *avatarsService) GetByID(
 		s.logger.Error().Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to retrieve avatar")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 
@@ -389,8 +399,7 @@ func (s *avatarsService) GetByID(
 		s.logger.Error().Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to load avatar from the storage")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 
@@ -401,9 +410,12 @@ func (s *avatarsService) GetMetadataByID(
 	ctx context.Context,
 	id uuid.UUID,
 ) (*GetMetadataResult, error) {
-	ctx, span := tracer.Start(ctx, "avatars.get_metadata_by_id")
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.get_metadata_by_id",
+		attribute.String("id", id.String()),
+	)
 	defer span.End()
-	span.SetAttributes(attribute.String("id", id.String()))
 
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
@@ -413,8 +425,7 @@ func (s *avatarsService) GetMetadataByID(
 		s.logger.Error().Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to retrieve avatar")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return nil, ErrAvatarQueryFailed
 	}
 
@@ -438,17 +449,19 @@ func (s *avatarsService) GetByUserID(
 	ctx context.Context,
 	userID uuid.UUID,
 ) (string, []byte, error) {
-	ctx, span := tracer.Start(ctx, "avatars.get_by_user_id")
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.get_by_user_id",
+		attribute.String("user.id", userID.String()),
+	)
 	defer span.End()
-	span.SetAttributes(attribute.String("user.id", userID.String()))
 
 	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
 	if err != nil {
 		s.logger.Error().Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to retrieve user avatars")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 	if len(avatars) == 0 {
@@ -461,8 +474,7 @@ func (s *avatarsService) GetByUserID(
 		s.logger.Error().Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to retrieve last avatar")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 
@@ -474,13 +486,13 @@ func (s *avatarsService) DeleteByID(
 	id uuid.UUID,
 	userID uuid.UUID,
 ) error {
-	ctx, span := tracer.Start(ctx, "avatars.delete_by_id")
-	defer span.End()
-
-	span.SetAttributes(
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.delete_by_id",
 		attribute.String("user.id", userID.String()),
 		attribute.String("id", id.String()),
 	)
+	defer span.End()
 
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
@@ -491,8 +503,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to retrieve avatar")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return ErrAvatarQueryFailed
 	}
 
@@ -505,8 +516,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to delete avatar")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return ErrAvatarDeletionFailed
 	}
 
@@ -518,8 +528,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to queue avatar storage deletion")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return ErrAvatarDeletionFailed
 	}
 
@@ -530,9 +539,12 @@ func (s *avatarsService) CompleteResize(
 	ctx context.Context,
 	message pkg.MessageResizeDone,
 ) error {
-	ctx, span := tracer.Start(ctx, "avatars.complete_resize")
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.complete_resize",
+		attribute.String("id", message.ID.String()),
+	)
 	defer span.End()
-	span.SetAttributes(attribute.String("id", message.ID.String()))
 
 	thumbnailKeys := models.ThumbnailS3Keys{
 		Size100x100: message.ThumbnailS3Keys.Size100x100,
@@ -556,8 +568,7 @@ func (s *avatarsService) CompleteResize(
 		s.logger.Error().Err(err).
 			Str("avatar_id", message.ID.String()).
 			Msg("failed to complete avatar resize")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordServiceError(span, err)
 		return ErrUploadFailed
 	}
 
