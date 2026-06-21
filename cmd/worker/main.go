@@ -9,12 +9,10 @@ import (
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/worker"
-	"github.com/rs/zerolog"
 )
 
 func main() {
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+	logger := observability.NewLogger(os.Stdout)
 
 	cfg, err := config.LoadWorkerConfig()
 	if err != nil {

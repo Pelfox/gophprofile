@@ -192,7 +192,7 @@ func consumeResizeDoneQueue(
 
 			var message pkg.MessageResizeDone
 			if err := json.Unmarshal(delivery.Body, &message); err != nil {
-				logger.Error().Err(err).Msg("failed to unmarshal resize done message")
+				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to unmarshal resize done message")
 				if err := delivery.Nack(false, false); err != nil {
 					return fmt.Errorf("failed to reject resize done message: %w", err)
 				}
@@ -200,7 +200,7 @@ func consumeResizeDoneQueue(
 			}
 
 			if err := avatarsService.CompleteResize(deliveryCtx, message); err != nil {
-				logger.Error().Err(err).Msg("failed to complete avatar resize")
+				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to complete avatar resize")
 				requeue := !errors.Is(err, services.ErrAvatarNotFound)
 				if err := delivery.Nack(false, requeue); err != nil {
 					return fmt.Errorf("failed to reject resize done message: %w", err)

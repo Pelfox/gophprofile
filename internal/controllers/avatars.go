@@ -131,6 +131,7 @@ func (c *AvatarsController) GetByID(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(avatar); err != nil {
 		c.logger.Error().
+			Ctx(r.Context()).
 			Err(err).
 			Str("avatar_id", avatarID.String()).
 			Msg("failed to write avatar response")
@@ -229,6 +230,7 @@ func (c *AvatarsController) GetUserAvatar(
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(avatarBytes); err != nil {
 		c.logger.Error().
+			Ctx(r.Context()).
 			Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to write user avatar response")

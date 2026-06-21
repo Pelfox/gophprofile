@@ -161,7 +161,7 @@ func consumeQueues(
 					workerJobResultError,
 					time.Since(jobStart),
 				)
-				logger.Error().Err(err).Msg("failed to process resize job")
+				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to process resize job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
 				}
@@ -198,7 +198,7 @@ func consumeQueues(
 					workerJobResultError,
 					time.Since(jobStart),
 				)
-				logger.Error().Err(err).Msg("failed to process delete job")
+				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to process delete job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
 				}
@@ -272,7 +272,7 @@ func (p *processor) processResize(ctx context.Context, body []byte) error {
 
 	thumbnailKeys, err := p.createThumbnails(ctx, message)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to create thumbnails")
+		logger.Error().Ctx(ctx).Err(err).Msg("failed to create thumbnails")
 		return fmt.Errorf("failed to create thumbnails: %w", err)
 	}
 
@@ -286,7 +286,7 @@ func (p *processor) processResize(ctx context.Context, body []byte) error {
 		return fmt.Errorf("failed to publish resize completion: %w", err)
 	}
 
-	logger.Info().Msg("processed resize job")
+	logger.Info().Ctx(ctx).Msg("processed resize job")
 	return nil
 }
 
@@ -304,6 +304,7 @@ func (p *processor) processDelete(ctx context.Context, body []byte) error {
 	}
 
 	p.logger.Info().
+		Ctx(ctx).
 		Str("avatar_id", message.ID.String()).
 		Msg("processed delete job")
 	return nil
