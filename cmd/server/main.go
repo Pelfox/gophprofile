@@ -7,6 +7,7 @@ import (
 	"github.com/pelfox/gophprofile/internal/app"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/observability"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func main() {
@@ -17,9 +18,11 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to load configuration")
 	}
 
-	if err := observability.InitMetrics(); err != nil {
+	metricsRegistry := prometheus.NewRegistry()
+	if err := observability.InitMetrics(metricsRegistry); err != nil {
 		logger.Fatal().Err(err).Msg("failed to initialize Prometheus metrics")
 	}
+	metricsHandler := observability.MetricsHandler(metricsRegistry)
 
 	// Initializing OpenTelemetry tracing.
 	shutdownTracing, err := observability.InitTracing(
@@ -32,7 +35,7 @@ func main() {
 	}
 	defer shutdownTracing(context.Background())
 
-	if err := app.Run(logger, cfg); err != nil {
+	if err := app.Run(logger, cfg, metricsHandler); err != nil {
 		logger.Fatal().Err(err).Msg("failed to run the application")
 	}
 }

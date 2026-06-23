@@ -30,7 +30,11 @@ import (
 const shutdownTimeout = 10 * time.Second
 
 // Run starts the application with the given logger and configuration.
-func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
+func Run(
+	logger zerolog.Logger,
+	cfg *config.AppConfig,
+	metricsHandler http.Handler,
+) error {
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -80,7 +84,7 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: newRouter(avatarsController),
+		Handler: newRouter(avatarsController, metricsHandler),
 	}
 
 	errCh := make(chan error, 2)
@@ -107,7 +111,10 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 	}
 }
 
-func newRouter(avatarsController *controllers.AvatarsController) http.Handler {
+func newRouter(
+	avatarsController *controllers.AvatarsController,
+	metricsHandler http.Handler,
+) http.Handler {
 	router := chi.NewRouter()
 
 	// Adding Prometheus request metrics before route handlers run.
@@ -119,7 +126,7 @@ func newRouter(avatarsController *controllers.AvatarsController) http.Handler {
 	})
 
 	// Exposing process and custom application metrics for Prometheus.
-	router.Handle("/metrics", observability.MetricsHandler())
+	router.Handle("/metrics", metricsHandler)
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})

@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -115,9 +116,12 @@ var (
 	)
 )
 
-// InitMetrics registers custom collectors in the default Prometheus registry.
-func InitMetrics() error {
-	collectors := []prometheus.Collector{
+// InitMetrics registers application and runtime collectors in the provided registry.
+func InitMetrics(registerer prometheus.Registerer) error {
+	metricCollectors := []prometheus.Collector{
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewBuildInfoCollector(),
 		httpRequestsTotal,
 		httpRequestDuration,
 		avatarUploadsTotal,
@@ -129,8 +133,8 @@ func InitMetrics() error {
 		workerJobDuration,
 	}
 
-	for _, collector := range collectors {
-		if err := prometheus.Register(collector); err != nil {
+	for _, collector := range metricCollectors {
+		if err := registerer.Register(collector); err != nil {
 			return fmt.Errorf("failed to register Prometheus metrics: %w", err)
 		}
 	}
@@ -161,9 +165,9 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
-// MetricsHandler exposes Prometheus metrics for scraping.
-func MetricsHandler() http.Handler {
-	return promhttp.Handler()
+// MetricsHandler exposes metrics from the provided gatherer for scraping.
+func MetricsHandler(gatherer prometheus.Gatherer) http.Handler {
+	return promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})
 }
 
 // HTTPMetricsMiddleware records request counters and latency with route labels.

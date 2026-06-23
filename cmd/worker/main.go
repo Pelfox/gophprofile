@@ -9,6 +9,7 @@ import (
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/worker"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func main() {
@@ -19,7 +20,8 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to load worker configuration")
 	}
 
-	if err := observability.InitMetrics(); err != nil {
+	metricsRegistry := prometheus.NewRegistry()
+	if err := observability.InitMetrics(metricsRegistry); err != nil {
 		logger.Fatal().Err(err).Msg("failed to initialize Prometheus metrics")
 	}
 
