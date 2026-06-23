@@ -149,11 +149,7 @@ func consumeQueues(
 				return errors.New("resize queue consumer closed")
 			}
 
-			deliveryCtx := otel.GetTextMapPropagator().Extract(
-				ctx,
-				observability.AMQPHeaderCarrier(delivery.Headers),
-			)
-
+			deliveryCtx := extractDeliveryContext(ctx, delivery.Headers)
 			jobStart := time.Now()
 			if err := processor.processResize(deliveryCtx, delivery.Body); err != nil {
 				observability.ObserveWorkerJob(
@@ -186,11 +182,7 @@ func consumeQueues(
 				return errors.New("delete queue consumer closed")
 			}
 
-			deliveryCtx := otel.GetTextMapPropagator().Extract(
-				ctx,
-				observability.AMQPHeaderCarrier(delivery.Headers),
-			)
-
+			deliveryCtx := extractDeliveryContext(ctx, delivery.Headers)
 			jobStart := time.Now()
 			if err := processor.processDelete(deliveryCtx, delivery.Body); err != nil {
 				observability.ObserveWorkerJob(
@@ -236,6 +228,13 @@ func declareQueue(channel *amqp.Channel, name string) (amqp.Queue, error) {
 	}
 
 	return queue, nil
+}
+
+func extractDeliveryContext(ctx context.Context, headers amqp.Table) context.Context {
+	return otel.GetTextMapPropagator().Extract(
+		ctx,
+		observability.AMQPHeaderCarrier(headers),
+	)
 }
 
 func rejectDelivery(delivery amqp.Delivery, err error) error {
