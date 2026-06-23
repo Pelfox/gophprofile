@@ -17,6 +17,10 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to load configuration")
 	}
 
+	if err := observability.InitMetrics(); err != nil {
+		logger.Fatal().Err(err).Msg("failed to initialize Prometheus metrics")
+	}
+
 	// Initializing OpenTelemetry tracing.
 	shutdownTracing, err := observability.InitTracing(
 		context.Background(),

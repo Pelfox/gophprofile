@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -114,9 +115,9 @@ var (
 	)
 )
 
-func init() {
-	// Register all custom collectors in the default registry used by promhttp.Handler.
-	prometheus.MustRegister(
+// InitMetrics registers custom collectors in the default Prometheus registry.
+func InitMetrics() error {
+	collectors := []prometheus.Collector{
 		httpRequestsTotal,
 		httpRequestDuration,
 		avatarUploadsTotal,
@@ -126,7 +127,15 @@ func init() {
 		queuePublishesTotal,
 		workerJobsTotal,
 		workerJobDuration,
-	)
+	}
+
+	for _, collector := range collectors {
+		if err := prometheus.Register(collector); err != nil {
+			return fmt.Errorf("failed to register Prometheus metrics: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // statusRecorder captures the final response status for HTTP metrics.
