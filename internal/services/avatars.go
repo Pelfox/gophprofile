@@ -13,14 +13,61 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/models"
+	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const maxFileSize = 10485760 // 10 MiB
+
+const (
+	// Avatar upload metric results describe the step where the upload workflow ended.
+	avatarUploadResultSuccess       = observability.MetricsResultSuccess
+	avatarUploadResultFileTooLarge  = "file_too_large"
+	avatarUploadResultInvalidFile   = "invalid_file"
+	avatarUploadResultUnsupported   = "unsupported_file"
+	avatarUploadResultDBError       = "db_error"
+	avatarUploadResultStorageError  = "storage_error"
+	avatarUploadResultQueueError    = "queue_error"
+	avatarUploadResultInternalError = "internal_error"
+
+	// Avatar processing metric statuses describe queueing and resize completion transitions.
+	avatarProcessingStatusQueued    = "queued"
+	avatarProcessingStatusCompleted = "completed"
+	avatarProcessingStatusFailed    = "failed"
+
+	// Avatar deletion metric results describe the final outcome of a delete request.
+	avatarDeletionResultSuccess   = observability.MetricsResultSuccess
+	avatarDeletionResultNotFound  = "not_found"
+	avatarDeletionResultForbidden = "forbidden"
+	avatarDeletionResultError     = observability.MetricsResultError
+)
+
+var tracer = otel.Tracer("github.com/pelfox/gophprofile/internal/services")
+
+func startServiceSpan(
+	ctx context.Context,
+	name string,
+	attrs ...attribute.KeyValue,
+) (context.Context, trace.Span) {
+	return tracer.Start(ctx, name, trace.WithAttributes(attrs...))
+}
+
+func recordServiceError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}
 
 var (
 	// ErrFileTooLarge is returned when the file exceeds the upload size limit.
@@ -200,24 +247,44 @@ func (s *avatarsService) Create(
 	userID uuid.UUID,
 	input CreateAvatarInput,
 ) (*CreateAvatarResult, error) {
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.create",
+		attribute.String("user.id", userID.String()),
+		attribute.Int64("avatar.file.size", input.Header.Size),
+		attribute.String("avatar.file.name", input.Header.Filename),
+	)
+	defer span.End()
+
+	uploadResult := avatarUploadResultSuccess
+	defer func() {
+		observability.RecordAvatarUpload(uploadResult, input.Header.Size)
+	}()
+
 	if input.Header.Size > maxFileSize {
+		uploadResult = avatarUploadResultFileTooLarge
 		return nil, ErrFileTooLarge
 	}
 
 	bytes, err := io.ReadAll(input.File)
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to read the file")
+		uploadResult = avatarUploadResultInvalidFile
+		recordServiceError(span, err)
+		s.logger.Error().Ctx(ctx).Err(err).Msg("failed to read the file")
 		return nil, ErrInvalidFile
 	}
 
 	mimeType := http.DetectContentType(bytes)
 	if !slices.Contains(supportedMimeTypes, mimeType) {
+		uploadResult = avatarUploadResultUnsupported
 		return nil, ErrUnsupportedFile
 	}
 
 	fileID, err := uuid.NewV7()
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to create a new file ID")
+		uploadResult = avatarUploadResultInternalError
+		recordServiceError(span, err)
+		s.logger.Error().Ctx(ctx).Err(err).Msg("failed to create a new file ID")
 		return nil, ErrUploadFailed
 	}
 
@@ -232,7 +299,9 @@ func (s *avatarsService) Create(
 		S3Key:     fileName,
 	})
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to create a new avatar")
+		uploadResult = avatarUploadResultDBError
+		recordServiceError(span, err)
+		s.logger.Error().Ctx(ctx).Err(err).Msg("failed to create a new avatar")
 		return nil, ErrUploadFailed
 	}
 
@@ -243,7 +312,9 @@ func (s *avatarsService) Create(
 		models.UploadStatusUploading,
 	)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to update upload status")
+		uploadResult = avatarUploadResultDBError
+		recordServiceError(span, err)
+		logger.Error().Ctx(ctx).Err(err).Msg("failed to update upload status")
 		return nil, ErrUploadFailed
 	}
 
@@ -258,11 +329,15 @@ func (s *avatarsService) Create(
 		storeErr := err
 		_, statusErr := s.updateUploadStatus(ctx, avatar.ID, models.UploadStatusFailed)
 		if statusErr != nil {
-			logger.Error().Err(statusErr).Msg("failed to update upload status")
+			uploadResult = avatarUploadResultDBError
+			recordServiceError(span, statusErr)
+			logger.Error().Ctx(ctx).Err(statusErr).Msg("failed to update upload status")
 			return nil, ErrUploadFailed
 		}
 
-		logger.Error().Err(storeErr).Msg("failed to upload avatar to S3")
+		uploadResult = avatarUploadResultStorageError
+		recordServiceError(span, storeErr)
+		logger.Error().Ctx(ctx).Err(storeErr).Msg("failed to upload avatar to S3")
 		return nil, ErrUploadFailed
 	}
 
@@ -272,7 +347,9 @@ func (s *avatarsService) Create(
 		models.UploadStatusCompleted,
 	)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to update upload status")
+		uploadResult = avatarUploadResultDBError
+		recordServiceError(span, err)
+		logger.Error().Ctx(ctx).Err(err).Msg("failed to update upload status")
 		return nil, ErrUploadFailed
 	}
 
@@ -285,17 +362,20 @@ func (s *avatarsService) Create(
 		},
 	)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to update processing status")
+		uploadResult = avatarUploadResultDBError
+		recordServiceError(span, err)
+		logger.Error().Ctx(ctx).Err(err).Msg("failed to update processing status")
 		return nil, ErrUploadFailed
 	}
 
-	err = s.queue.RequestResize(ctx, pkg.MessageResizeRequest{
+	queueErr := s.queue.RequestResize(ctx, pkg.MessageResizeRequest{
 		ID:       avatar.ID,
 		UserID:   avatar.UserID,
 		FileName: fileName,
 		Key:      fileKey,
 	})
-	if err != nil {
+	if queueErr != nil {
+		uploadResult = avatarUploadResultQueueError
 		newProcessingStatus := models.ProcessingStatusFailed
 		avatar, err = s.avatarsRepository.Update(
 			ctx,
@@ -305,14 +385,18 @@ func (s *avatarsService) Create(
 			},
 		)
 		if err != nil {
-			logger.Error().Err(err).Msg("failed to update processing status")
+			recordServiceError(span, err)
+			logger.Error().Ctx(ctx).Err(err).Msg("failed to update processing status")
 			return nil, ErrUploadFailed
 		}
 
-		logger.Error().Err(err).Msg("failed to queue file resize")
+		observability.RecordAvatarProcessing(avatarProcessingStatusFailed)
+		recordServiceError(span, queueErr)
+		logger.Error().Ctx(ctx).Err(queueErr).Msg("failed to queue file resize")
 		return nil, ErrUploadFailed
 	}
-	logger.Info().Msg("queued file resize job")
+	observability.RecordAvatarProcessing(avatarProcessingStatusQueued)
+	logger.Info().Ctx(ctx).Msg("queued file resize job")
 
 	response := CreateAvatarResult{
 		ID:               avatar.ID,
@@ -333,22 +417,31 @@ func (s *avatarsService) GetByID(
 	ctx context.Context,
 	id uuid.UUID,
 ) (string, []byte, error) {
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.get_by_id",
+		attribute.String("id", id.String()),
+	)
+	defer span.End()
+
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
 			return "", nil, ErrAvatarNotFound
 		}
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to retrieve avatar")
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 
 	avatarBytes, err := s.storage.Retrieve(ctx, avatar.S3Key)
 	if err != nil {
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to load avatar from the storage")
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 
@@ -359,14 +452,22 @@ func (s *avatarsService) GetMetadataByID(
 	ctx context.Context,
 	id uuid.UUID,
 ) (*GetMetadataResult, error) {
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.get_metadata_by_id",
+		attribute.String("id", id.String()),
+	)
+	defer span.End()
+
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
 			return nil, ErrAvatarNotFound
 		}
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to retrieve avatar")
+		recordServiceError(span, err)
 		return nil, ErrAvatarQueryFailed
 	}
 
@@ -390,11 +491,19 @@ func (s *avatarsService) GetByUserID(
 	ctx context.Context,
 	userID uuid.UUID,
 ) (string, []byte, error) {
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.get_by_user_id",
+		attribute.String("user.id", userID.String()),
+	)
+	defer span.End()
+
 	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
 	if err != nil {
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to retrieve user avatars")
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 	if len(avatars) == 0 {
@@ -404,9 +513,10 @@ func (s *avatarsService) GetByUserID(
 	avatar := avatars[0]
 	avatarBytes, err := s.storage.Retrieve(ctx, avatar.S3Key)
 	if err != nil {
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to retrieve last avatar")
+		recordServiceError(span, err)
 		return "", nil, ErrAvatarQueryFailed
 	}
 
@@ -418,27 +528,46 @@ func (s *avatarsService) DeleteByID(
 	id uuid.UUID,
 	userID uuid.UUID,
 ) error {
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.delete_by_id",
+		attribute.String("user.id", userID.String()),
+		attribute.String("id", id.String()),
+	)
+	defer span.End()
+
+	deletionResult := avatarDeletionResultSuccess
+	defer func() {
+		observability.RecordAvatarDeletion(deletionResult)
+	}()
+
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
+			deletionResult = avatarDeletionResultNotFound
 			return ErrAvatarNotFound
 		}
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to retrieve avatar")
+		deletionResult = avatarDeletionResultError
+		recordServiceError(span, err)
 		return ErrAvatarQueryFailed
 	}
 
 	if avatar.UserID != userID {
+		deletionResult = avatarDeletionResultForbidden
 		return ErrAvatarDeletionForbidden
 	}
 
 	if err := s.avatarsRepository.Delete(ctx, id); err != nil {
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to delete avatar")
+		deletionResult = avatarDeletionResultError
+		recordServiceError(span, err)
 		return ErrAvatarDeletionFailed
 	}
 
@@ -446,10 +575,12 @@ func (s *avatarsService) DeleteByID(
 		ID:   id,
 		Keys: getAvatarStorageKeys(avatar),
 	}); err != nil {
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to queue avatar storage deletion")
+		deletionResult = avatarDeletionResultError
+		recordServiceError(span, err)
 		return ErrAvatarDeletionFailed
 	}
 
@@ -460,6 +591,13 @@ func (s *avatarsService) CompleteResize(
 	ctx context.Context,
 	message pkg.MessageResizeDone,
 ) error {
+	ctx, span := startServiceSpan(
+		ctx,
+		"avatars.complete_resize",
+		attribute.String("id", message.ID.String()),
+	)
+	defer span.End()
+
 	thumbnailKeys := models.ThumbnailS3Keys{
 		Size100x100: message.ThumbnailS3Keys.Size100x100,
 		Size300x300: message.ThumbnailS3Keys.Size300x300,
@@ -476,15 +614,19 @@ func (s *avatarsService) CompleteResize(
 	)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
+			observability.RecordAvatarProcessing(avatarProcessingStatusFailed)
 			return ErrAvatarNotFound
 		}
 
-		s.logger.Error().Err(err).
+		s.logger.Error().Ctx(ctx).Err(err).
 			Str("avatar_id", message.ID.String()).
 			Msg("failed to complete avatar resize")
+		observability.RecordAvatarProcessing(avatarProcessingStatusFailed)
+		recordServiceError(span, err)
 		return ErrUploadFailed
 	}
 
+	observability.RecordAvatarProcessing(avatarProcessingStatusCompleted)
 	return nil
 }
 

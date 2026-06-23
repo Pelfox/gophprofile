@@ -10,14 +10,17 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"path"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/config"
+	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
@@ -26,6 +29,13 @@ const (
 	consumerPrefetch     = 1
 	thumbnailContentType = "image/jpeg"
 	thumbnailQuality     = 90
+
+	// Worker metric label values are intentionally low-cardinality.
+	workerJobResize         = "resize"
+	workerJobDelete         = "delete"
+	workerJobResultSuccess  = observability.MetricsResultSuccess
+	workerJobResultError    = observability.MetricsResultError
+	workerJobResultAckError = "ack_error"
 )
 
 type thumbnailSize struct {
@@ -139,8 +149,15 @@ func consumeQueues(
 				return errors.New("resize queue consumer closed")
 			}
 
-			if err := processor.processResize(ctx, delivery.Body); err != nil {
-				logger.Error().Err(err).Msg("failed to process resize job")
+			deliveryCtx := extractDeliveryContext(ctx, delivery.Headers)
+			jobStart := time.Now()
+			if err := processor.processResize(deliveryCtx, delivery.Body); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobResize,
+					workerJobResultError,
+					time.Since(jobStart),
+				)
+				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to process resize job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
 				}
@@ -148,15 +165,32 @@ func consumeQueues(
 			}
 
 			if err := delivery.Ack(false); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobResize,
+					workerJobResultAckError,
+					time.Since(jobStart),
+				)
 				return fmt.Errorf("failed to acknowledge resize job: %w", err)
 			}
+			observability.ObserveWorkerJob(
+				workerJobResize,
+				workerJobResultSuccess,
+				time.Since(jobStart),
+			)
 		case delivery, ok := <-deleteDeliveries:
 			if !ok {
 				return errors.New("delete queue consumer closed")
 			}
 
-			if err := processor.processDelete(ctx, delivery.Body); err != nil {
-				logger.Error().Err(err).Msg("failed to process delete job")
+			deliveryCtx := extractDeliveryContext(ctx, delivery.Headers)
+			jobStart := time.Now()
+			if err := processor.processDelete(deliveryCtx, delivery.Body); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobDelete,
+					workerJobResultError,
+					time.Since(jobStart),
+				)
+				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to process delete job")
 				if err := rejectDelivery(delivery, err); err != nil {
 					return err
 				}
@@ -164,8 +198,18 @@ func consumeQueues(
 			}
 
 			if err := delivery.Ack(false); err != nil {
+				observability.ObserveWorkerJob(
+					workerJobDelete,
+					workerJobResultAckError,
+					time.Since(jobStart),
+				)
 				return fmt.Errorf("failed to acknowledge delete job: %w", err)
 			}
+			observability.ObserveWorkerJob(
+				workerJobDelete,
+				workerJobResultSuccess,
+				time.Since(jobStart),
+			)
 		}
 	}
 }
@@ -184,6 +228,13 @@ func declareQueue(channel *amqp.Channel, name string) (amqp.Queue, error) {
 	}
 
 	return queue, nil
+}
+
+func extractDeliveryContext(ctx context.Context, headers amqp.Table) context.Context {
+	return otel.GetTextMapPropagator().Extract(
+		ctx,
+		observability.AMQPHeaderCarrier(headers),
+	)
 }
 
 func rejectDelivery(delivery amqp.Delivery, err error) error {
@@ -220,7 +271,7 @@ func (p *processor) processResize(ctx context.Context, body []byte) error {
 
 	thumbnailKeys, err := p.createThumbnails(ctx, message)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to create thumbnails")
+		logger.Error().Ctx(ctx).Err(err).Msg("failed to create thumbnails")
 		return fmt.Errorf("failed to create thumbnails: %w", err)
 	}
 
@@ -234,7 +285,7 @@ func (p *processor) processResize(ctx context.Context, body []byte) error {
 		return fmt.Errorf("failed to publish resize completion: %w", err)
 	}
 
-	logger.Info().Msg("processed resize job")
+	logger.Info().Ctx(ctx).Msg("processed resize job")
 	return nil
 }
 
@@ -252,6 +303,7 @@ func (p *processor) processDelete(ctx context.Context, body []byte) error {
 	}
 
 	p.logger.Info().
+		Ctx(ctx).
 		Str("avatar_id", message.ID.String()).
 		Msg("processed delete job")
 	return nil

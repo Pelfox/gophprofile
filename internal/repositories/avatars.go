@@ -10,7 +10,18 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pelfox/gophprofile/internal/models"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const (
+	avatarsTableName = "avatars"
+	dbSystemName     = "postgresql"
+)
+
+var tracer = otel.Tracer("github.com/pelfox/gophprofile/internal/repositories")
 
 var (
 	// ErrAvatarNotFound is returned when no non-deleted avatar matches a query.
@@ -76,6 +87,36 @@ type avatarsRepository struct {
 	sq   squirrel.StatementBuilderType
 }
 
+// startDatabaseSpan creates a repository span with common PostgreSQL attributes.
+func startDatabaseSpan(
+	ctx context.Context,
+	name string,
+	operation string,
+	query string,
+	attrs ...attribute.KeyValue,
+) (context.Context, trace.Span) {
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("db.system", dbSystemName),
+		attribute.String("db.operation", operation),
+		attribute.String("db.sql.table", avatarsTableName),
+		attribute.String("db.statement", query),
+	}
+	baseAttrs = append(baseAttrs, attrs...)
+
+	return tracer.Start(ctx, name, trace.WithAttributes(baseAttrs...))
+}
+
+// recordDatabaseError marks a span as failed for driver or scan errors.
+// pgx.ErrNoRows is a valid query result and is translated to a domain error.
+func recordDatabaseError(span trace.Span, err error) {
+	if err == nil || errors.Is(err, pgx.ErrNoRows) {
+		return
+	}
+
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}
+
 // NewAvatarsRepository creates an avatar repository backed by a Postgres pool.
 func NewAvatarsRepository(pool *pgxpool.Pool) AvatarsRepository {
 	return &avatarsRepository{
@@ -105,6 +146,15 @@ func (r *avatarsRepository) Create(
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
 
+	ctx, span := startDatabaseSpan(
+		ctx,
+		"db.avatars.create",
+		"INSERT",
+		query,
+		attribute.String("user.id", input.UserID.String()),
+	)
+	defer span.End()
+
 	avatar := models.Avatar{
 		UserID:    input.UserID,
 		FileName:  input.FileName,
@@ -121,6 +171,7 @@ func (r *avatarsRepository) Create(
 			&avatar.UpdatedAt,
 		)
 	if err != nil {
+		recordDatabaseError(span, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 
@@ -151,8 +202,18 @@ func (r *avatarsRepository) GetForUser(
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
 
+	ctx, span := startDatabaseSpan(
+		ctx,
+		"db.avatars.get_for_user",
+		"SELECT",
+		query,
+		attribute.String("user.id", userID.String()),
+	)
+	defer span.End()
+
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
+		recordDatabaseError(span, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
@@ -173,14 +234,17 @@ func (r *avatarsRepository) GetForUser(
 			&avatar.UpdatedAt,
 		)
 		if err != nil {
+			recordDatabaseError(span, err)
 			return nil, fmt.Errorf("failed to scan the row: %w", err)
 		}
 		avatars = append(avatars, avatar)
 	}
 
 	if err := rows.Err(); err != nil {
+		recordDatabaseError(span, err)
 		return nil, fmt.Errorf("failed to scan: %w", err)
 	}
+	span.SetAttributes(attribute.Int("db.rows_returned", len(avatars)))
 
 	return avatars, nil
 }
@@ -208,6 +272,15 @@ func (r *avatarsRepository) GetByID(
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
 
+	ctx, span := startDatabaseSpan(
+		ctx,
+		"db.avatars.get_by_id",
+		"SELECT",
+		query,
+		attribute.String("avatar.id", id.String()),
+	)
+	defer span.End()
+
 	avatar := models.Avatar{ID: id}
 	err = r.pool.QueryRow(ctx, query, args...).Scan(
 		&avatar.UserID,
@@ -222,6 +295,7 @@ func (r *avatarsRepository) GetByID(
 		&avatar.UpdatedAt,
 	)
 	if err != nil {
+		recordDatabaseError(span, err)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAvatarNotFound
 		}
@@ -260,6 +334,15 @@ func (r *avatarsRepository) Update(
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
 
+	ctx, span := startDatabaseSpan(
+		ctx,
+		"db.avatars.update",
+		"UPDATE",
+		query,
+		attribute.String("avatar.id", id.String()),
+	)
+	defer span.End()
+
 	avatar := models.Avatar{ID: id}
 	err = r.pool.QueryRow(ctx, query, args...).Scan(
 		&avatar.UserID,
@@ -274,6 +357,7 @@ func (r *avatarsRepository) Update(
 		&avatar.UpdatedAt,
 	)
 	if err != nil {
+		recordDatabaseError(span, err)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAvatarNotFound
 		}
@@ -295,10 +379,21 @@ func (r *avatarsRepository) Delete(
 		return fmt.Errorf("failed to build query: %w", err)
 	}
 
+	ctx, span := startDatabaseSpan(
+		ctx,
+		"db.avatars.delete",
+		"UPDATE",
+		query,
+		attribute.String("avatar.id", id.String()),
+	)
+	defer span.End()
+
 	result, err := r.pool.Exec(ctx, query, args...)
 	if err != nil {
+		recordDatabaseError(span, err)
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
+	span.SetAttributes(attribute.Int64("db.rows_affected", result.RowsAffected()))
 
 	if result.RowsAffected() == 0 {
 		return ErrAvatarNotFound
