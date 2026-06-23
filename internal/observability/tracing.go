@@ -12,15 +12,13 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 )
 
-type providerShutdownFunc = func(ctx context.Context) error
-
 // InitTracing initializes tracing through OpenTelemetry. It returns a shutdown
 // function for initialized OpenTelemetry provider.
 func InitTracing(
 	ctx context.Context,
 	serviceName string,
 	traceEndpoint string,
-) (providerShutdownFunc, error) {
+) (func(ctx context.Context) error, error) {
 	exporter, err := otlptracehttp.New(
 		ctx,
 		otlptracehttp.WithEndpoint(traceEndpoint),
