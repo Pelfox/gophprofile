@@ -16,6 +16,9 @@ type AppConfig struct {
 	// DatabaseURL is the database connection URL.
 	DatabaseURL string `env:"DATABASE_URL"`
 
+	// TelemetryEndpoint is OTLP endpoint for OpenTelemetry.
+	TelemetryEndpoint string `env:"TELEMETRY_ENDPOINT"`
+
 	// S3Region is the AWS S3 region used for object storage.
 	S3Region string `env:"S3_REGION"`
 	// S3Endpoint is the custom S3-compatible endpoint, if one is used.
@@ -40,11 +43,15 @@ func Load() (*AppConfig, error) {
 	return &cfg, nil
 }
 
+// WorkerConfig stores configuration for worker process.
 type WorkerConfig struct {
 	// RabbitMQURL is the connection URL for RabbitMQ.
 	RabbitMQURL string `env:"RABBITMQ_URL"`
 	// DatabaseURL is the database connection URL.
 	DatabaseURL string `env:"DATABASE_URL"`
+
+	// TelemetryEndpoint is OTLP endpoint for OpenTelemetry.
+	TelemetryEndpoint string `env:"TELEMETRY_ENDPOINT"`
 
 	// S3Region is the AWS S3 region used for object storage.
 	S3Region string `env:"S3_REGION"`
@@ -58,6 +65,7 @@ type WorkerConfig struct {
 	S3Bucket string `env:"S3_BUCKET"`
 }
 
+// LoadWorkerConfig loads worker configuration from environment variables.
 func LoadWorkerConfig() (*WorkerConfig, error) {
 	_ = godotenv.Load()
 
