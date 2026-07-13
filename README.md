@@ -10,6 +10,7 @@ that creates `100x100` and `300x300` JPEG thumbnails and processes deletions.
 - Upload JPEG, PNG, and WebP avatars up to 10 MiB.
 - Retrieve an original avatar, its metadata, or a user's latest avatar.
 - Generate thumbnails asynchronously with RabbitMQ-backed jobs.
+- Drain the active worker job gracefully during Kubernetes termination.
 - Soft-delete metadata and remove related objects asynchronously.
 - Export Prometheus metrics and OpenTelemetry traces.
 - Expose Kubernetes liveness and readiness checks.
