@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/controllers"
+	"github.com/pelfox/gophprofile/internal/healthcheck"
 	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
@@ -83,8 +84,12 @@ func Run(
 	)
 
 	server := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: newRouter(avatarsController, metricsHandler),
+		Addr: cfg.ListenAddr,
+		Handler: newRouter(
+			avatarsController,
+			metricsHandler,
+			healthcheck.NewHandler(pool, conn),
+		),
 	}
 
 	errCh := make(chan error, 2)
@@ -114,6 +119,7 @@ func Run(
 func newRouter(
 	avatarsController *controllers.AvatarsController,
 	metricsHandler http.Handler,
+	healthHandler *healthcheck.Handler,
 ) http.Handler {
 	router := chi.NewRouter()
 
@@ -127,6 +133,8 @@ func newRouter(
 
 	// Exposing process and custom application metrics for Prometheus.
 	router.Handle("/metrics", metricsHandler)
+	router.Get("/health/live", healthHandler.Liveness)
+	router.Get("/health/ready", healthHandler.Readiness)
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})

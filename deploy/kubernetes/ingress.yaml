@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gophprofile
+  labels:
+    app.kubernetes.io/name: gophprofile
+spec:
+  ingressClassName: nginx
+  rules:
+    # This hostname must be replaced before deployment.
+    - host: ...
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gophprofile-api
+                port:
+                  name: http
