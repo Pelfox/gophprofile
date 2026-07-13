@@ -7,6 +7,8 @@ metadata:
     app.kubernetes.io/component: api
 spec:
   type: ClusterIP
+  internalTrafficPolicy: Cluster
+  sessionAffinity: None
   selector:
     app.kubernetes.io/name: gophprofile
     app.kubernetes.io/component: api

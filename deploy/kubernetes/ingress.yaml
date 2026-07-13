@@ -4,6 +4,8 @@ metadata:
   name: gophprofile
   labels:
     app.kubernetes.io/name: gophprofile
+  annotations:
+    nginx.ingress.kubernetes.io/load-balance: "round_robin"
 spec:
   ingressClassName: nginx
   rules:

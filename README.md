@@ -13,7 +13,7 @@ that creates `100x100` and `300x300` JPEG thumbnails and processes deletions.
 - Soft-delete metadata and remove related objects asynchronously.
 - Export Prometheus metrics and OpenTelemetry traces.
 - Expose Kubernetes liveness and readiness checks.
-- Deploy the API and worker with Docker and Kubernetes.
+- Deploy the API and worker with Docker, Kubernetes HPA, and load balancing.
 
 ## API
 

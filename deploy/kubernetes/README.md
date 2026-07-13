@@ -24,13 +24,33 @@ Run the SQL migrations from `migrations/` against `DATABASE_URL` before the
 first rollout, then deploy:
 
 ```bash
-kubectl apply -k deploy/kubernetes
+kubectl apply \
+  -f deploy/kubernetes/configmap.yaml \
+  -f deploy/kubernetes/api-deployment.yaml \
+  -f deploy/kubernetes/api-hpa.yaml \
+  -f deploy/kubernetes/worker-deployment.yaml \
+  -f deploy/kubernetes/worker-hpa.yaml \
+  -f deploy/kubernetes/service.yaml \
+  -f deploy/kubernetes/ingress.yaml
 kubectl -n gophprofile rollout status deployment/gophprofile-api
 kubectl -n gophprofile rollout status deployment/gophprofile-worker
 ```
 
 Add a `spec.tls` section and a certificate Secret to support TLS termination at
 the Ingress.
+
+## Autoscaling and load balancing
+
+Two HorizontalPodAutoscalers are installed:
+
+| Workload             | Replicas | Metrics                           |
+| -------------------- | -------- | --------------------------------- |
+| `gophprofile-api`    | 2-10     | 70% CPU or 80% memory utilization |
+| `gophprofile-worker` | 1-10     | 70% CPU utilization               |
+
+Both Deployments define resource requests, which HPA uses as the utilization
+baseline. Scale-up reacts immediately. Scale-down waits five minutes and then
+removes at most one pod per minute to reduce replica-count flapping.
 
 ## Health endpoints
 
