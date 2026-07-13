@@ -14,6 +14,7 @@ that creates `100x100` and `300x300` JPEG thumbnails and processes deletions.
 - Export Prometheus metrics and OpenTelemetry traces.
 - Expose Kubernetes liveness and readiness checks.
 - Deploy the API and worker with Docker, Kubernetes HPA, and load balancing.
+- Run as non-root with restricted security contexts and NetworkPolicy rules.
 
 ## API
 

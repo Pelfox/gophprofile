@@ -2,6 +2,7 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: gophprofile-worker
+  namespace: gophprofile
   labels:
     app.kubernetes.io/name: gophprofile
     app.kubernetes.io/component: worker

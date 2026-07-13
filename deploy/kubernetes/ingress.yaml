@@ -2,6 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: gophprofile
+  namespace: gophprofile
   labels:
     app.kubernetes.io/name: gophprofile
   annotations:

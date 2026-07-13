@@ -31,7 +31,8 @@ kubectl apply \
   -f deploy/kubernetes/worker-deployment.yaml \
   -f deploy/kubernetes/worker-hpa.yaml \
   -f deploy/kubernetes/service.yaml \
-  -f deploy/kubernetes/ingress.yaml
+  -f deploy/kubernetes/ingress.yaml \
+  -f deploy/kubernetes/network-policies.yaml
 kubectl -n gophprofile rollout status deployment/gophprofile-api
 kubectl -n gophprofile rollout status deployment/gophprofile-worker
 ```
@@ -51,6 +52,29 @@ Two HorizontalPodAutoscalers are installed:
 Both Deployments define resource requests, which HPA uses as the utilization
 baseline. Scale-up reacts immediately. Scale-down waits five minutes and then
 removes at most one pod per minute to reduce replica-count flapping.
+
+## Security
+
+The image and both workloads run with the numeric non-root UID/GID `65532`.
+Kubernetes also enforces `runAsNonRoot`, the `RuntimeDefault` seccomp profile,
+a read-only root filesystem, no privilege escalation, and no Linux
+capabilities. A size-limited `emptyDir` keeps `/tmp` writable without making
+the container filesystem writable.
+
+`network-policies.yaml` applies default-deny ingress and egress rules, then
+allows only:
+
+- API traffic on port `8080` from the `ingress-nginx` and `monitoring`
+  namespaces;
+- DNS lookups over TCP/UDP port `53`;
+- PostgreSQL on `5432`, AMQP/AMQPS on `5672`/`5671`, OTLP HTTP on `4318`, and
+  S3-compatible storage on `80`, `443`, or `9000` as required by each process.
+
+The cluster CNI must support Kubernetes NetworkPolicy. Change the namespace
+selectors if the Ingress controller or monitoring stack uses different
+namespaces, and update the egress ports when dependencies use non-standard
+ports. Apply and verify the allow rules before enabling the default-deny policy
+in an existing production namespace.
 
 ## Health endpoints
 

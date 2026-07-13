@@ -15,12 +15,12 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
-COPY --from=build --chown=nonroot:nonroot /out/server /app/server
-COPY --from=build --chown=nonroot:nonroot /out/worker /app/worker
-COPY --chown=nonroot:nonroot web /app/web
+COPY --from=build --chown=65532:65532 /out/server /app/server
+COPY --from=build --chown=65532:65532 /out/worker /app/worker
+COPY --chown=65532:65532 web /app/web
 
 EXPOSE 8080
 
-USER nonroot:nonroot
+USER 65532:65532
 
 ENTRYPOINT ["/app/server"]
