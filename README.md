@@ -14,6 +14,7 @@ that creates `100x100` and `300x300` JPEG thumbnails and processes deletions.
 - Soft-delete metadata and remove related objects asynchronously.
 - Export Prometheus metrics and OpenTelemetry traces.
 - Expose Kubernetes liveness and readiness checks.
+- Rate-limit API traffic and avatar uploads with sliding-window counters.
 - Deploy the API and worker with Docker, Kubernetes HPA, and load balancing.
 - Run as non-root with restricted security contexts and NetworkPolicy rules.
 
@@ -28,6 +29,13 @@ that creates `100x100` and `300x300` JPEG thumbnails and processes deletions.
 | `GET`    | `/api/v1/users/me/avatar`             | Return the user's latest avatar                   | `X-User-ID`     |
 
 `X-User-ID` and `avatarID` values must be valid UUIDs.
+
+## Rate limiting
+
+All `/api/v1` endpoints are limited to 10 requests per second per client IP.
+Avatar uploads have an additional per-IP limit of 5 requests per minute.
+Rejections are exported by the existing HTTP counter as
+`gophprofile_http_requests_total{status="429"}`.
 
 ## Health and observability
 
