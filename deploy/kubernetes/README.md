@@ -47,7 +47,7 @@ Two HorizontalPodAutoscalers are installed:
 | Workload             | Replicas | Metrics                           |
 | -------------------- | -------- | --------------------------------- |
 | `gophprofile-api`    | 2-10     | 70% CPU or 80% memory utilization |
-| `gophprofile-worker` | 1-10     | 70% CPU utilization               |
+| `gophprofile-worker` | 1-10     | 70% CPU or 80% memory utilization |
 
 Both Deployments define resource requests, which HPA uses as the utilization
 baseline. Scale-up reacts immediately. Scale-down waits five minutes and then
