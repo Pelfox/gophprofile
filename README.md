@@ -43,7 +43,6 @@ Rejections are exported by the existing HTTP counter as
 | --------------- | ---------------------------------------------- |
 | `/health/live`  | Confirms that the HTTP process is responding.  |
 | `/health/ready` | Checks PostgreSQL and the RabbitMQ connection. |
-| `/health`       | Compatibility alias for the readiness check.   |
 | `/metrics`      | Exposes Prometheus metrics.                    |
 
 Liveness deliberately does not check external dependencies, avoiding process

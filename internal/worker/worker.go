@@ -272,7 +272,9 @@ func newGracefulProcessingContext(
 	logger zerolog.Logger,
 	timeout time.Duration,
 ) (context.Context, func()) {
-	processingCtx, cancelProcessing := context.WithCancel(ctx)
+	processingCtx, cancelProcessing := context.WithCancel(
+		context.WithoutCancel(ctx),
+	)
 	done := make(chan struct{})
 	var stopOnce sync.Once
 
