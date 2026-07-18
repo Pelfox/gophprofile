@@ -40,6 +40,28 @@ kubectl -n gophprofile rollout status deployment/gophprofile-worker
 Add a `spec.tls` section and a certificate Secret to support TLS termination at
 the Ingress.
 
+When Prometheus Operator and its `ServiceMonitor` CRD are installed, enable API
+metrics discovery with:
+
+```bash
+kubectl apply -f deploy/kubernetes/service-monitor.yaml
+```
+
+## Helm
+
+The equivalent Helm chart is in `deploy/helm/gophprofile`. It keeps Secret
+creation disabled by default and uses the existing `gophprofile-secret`:
+
+```bash
+helm upgrade --install gophprofile deploy/helm/gophprofile \
+  --namespace gophprofile \
+  --create-namespace \
+  --set image.tag=TAG \
+  --set ingress.enabled=true \
+  --set 'ingress.hosts[0].host=...' \
+  --set serviceMonitor.enabled=true
+```
+
 ## Autoscaling and load balancing
 
 Two HorizontalPodAutoscalers are installed:
