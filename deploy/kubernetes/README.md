@@ -80,3 +80,6 @@ in an existing production namespace.
 
 - `GET /health/live` checks that the API process can answer HTTP requests.
 - `GET /health/ready` checks PostgreSQL and the RabbitMQ connection.
+- The worker updates `/tmp/gophprofile-worker.heartbeat` from its consumer loop
+  every five seconds while idle or between jobs. Its startup, liveness, and
+  readiness exec probes run `/app/worker healthcheck`.

@@ -294,6 +294,97 @@ func TestConsumeDeliveriesRequeuesCurrentJobAfterDrainTimeout(t *testing.T) {
 	}
 }
 
+func TestConsumeDeliveriesUpdatesHeartbeatWhileIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	heartbeat := make(chan time.Time, 1)
+	updated := make(chan struct{}, 1)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- consumeDeliveriesWithHeartbeat(
+			ctx,
+			ctx,
+			zerolog.Nop(),
+			make(chan amqp.Delivery),
+			make(chan amqp.Delivery),
+			&processor{},
+			heartbeat,
+			func() error {
+				updated <- struct{}{}
+				return nil
+			},
+		)
+	}()
+
+	heartbeat <- time.Now()
+	waitForSignal(t, updated, "worker heartbeat update")
+	cancel()
+
+	if err := waitForResult(t, result); err != nil {
+		t.Fatalf("consumeDeliveriesWithHeartbeat returned error: %v", err)
+	}
+}
+
+func TestConsumeDeliveriesDoesNotUpdateHeartbeatDuringJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	storageProvider := &blockingDeleteStorage{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}, 1),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(storageProvider.release)
+		}
+	}()
+
+	heartbeat := make(chan time.Time, 1)
+	updated := make(chan struct{}, 1)
+	deleteDeliveries := make(chan amqp.Delivery, 1)
+	deleteDeliveries <- testDeleteDelivery(t, newRecordingAcknowledger(), 1)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- consumeDeliveriesWithHeartbeat(
+			ctx,
+			context.Background(),
+			zerolog.Nop(),
+			make(chan amqp.Delivery),
+			deleteDeliveries,
+			&processor{
+				logger:  zerolog.Nop(),
+				queue:   &fakeQueue{},
+				storage: storageProvider,
+			},
+			heartbeat,
+			func() error {
+				updated <- struct{}{}
+				return nil
+			},
+		)
+	}()
+
+	waitForSignal(t, storageProvider.started, "current job to start")
+	heartbeat <- time.Now()
+	select {
+	case <-updated:
+		t.Fatal("heartbeat was updated while the current job was blocked")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cancel()
+	close(storageProvider.release)
+	released = true
+	if err := waitForResult(t, result); err != nil {
+		t.Fatalf("consumeDeliveriesWithHeartbeat returned error: %v", err)
+	}
+}
+
 func TestProcessorProcessResizeCreatesThumbnailsAndPublishesCompletion(
 	t *testing.T,
 ) {

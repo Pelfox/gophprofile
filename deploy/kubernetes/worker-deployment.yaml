@@ -38,6 +38,30 @@ spec:
                 name: gophprofile-config
             - secretRef:
                 name: gophprofile-secret
+          startupProbe:
+            exec:
+              command:
+                - /app/worker
+                - healthcheck
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command:
+                - /app/worker
+                - healthcheck
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /app/worker
+                - healthcheck
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m

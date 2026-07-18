@@ -62,6 +62,15 @@ func Run(
 	logger zerolog.Logger,
 	cfg *config.WorkerConfig,
 ) error {
+	if err := removeWorkerHeartbeat(workerHealthFilePath); err != nil {
+		return err
+	}
+	defer func() {
+		if err := removeWorkerHeartbeat(workerHealthFilePath); err != nil {
+			logger.Error().Err(err).Msg("failed to clean up worker heartbeat")
+		}
+	}()
+
 	conn, err := amqp.Dial(cfg.RabbitMQURL)
 	if err != nil {
 		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
@@ -148,13 +157,32 @@ func consumeQueues(
 	)
 	defer stopProcessing()
 
-	return consumeDeliveries(
+	updateHeartbeat := func() error {
+		if conn.IsClosed() {
+			return errors.New("rabbitmq connection is closed")
+		}
+		if channel.IsClosed() {
+			return errors.New("rabbitmq consumer channel is closed")
+		}
+
+		return writeWorkerHeartbeat(workerHealthFilePath, time.Now())
+	}
+	if err := updateHeartbeat(); err != nil {
+		return fmt.Errorf("failed to initialize worker heartbeat: %w", err)
+	}
+
+	heartbeatTicker := time.NewTicker(workerHeartbeatInterval)
+	defer heartbeatTicker.Stop()
+
+	return consumeDeliveriesWithHeartbeat(
 		ctx,
 		processingCtx,
 		logger,
 		resizeDeliveries,
 		deleteDeliveries,
 		processor,
+		heartbeatTicker.C,
+		updateHeartbeat,
 	)
 }
 
@@ -166,6 +194,28 @@ func consumeDeliveries(
 	deleteDeliveries <-chan amqp.Delivery,
 	processor *processor,
 ) error {
+	return consumeDeliveriesWithHeartbeat(
+		ctx,
+		processingCtx,
+		logger,
+		resizeDeliveries,
+		deleteDeliveries,
+		processor,
+		nil,
+		nil,
+	)
+}
+
+func consumeDeliveriesWithHeartbeat(
+	ctx context.Context,
+	processingCtx context.Context,
+	logger zerolog.Logger,
+	resizeDeliveries <-chan amqp.Delivery,
+	deleteDeliveries <-chan amqp.Delivery,
+	processor *processor,
+	heartbeat <-chan time.Time,
+	updateHeartbeat func() error,
+) error {
 	logger.Info().Msg("started avatar worker")
 	defer logger.Info().Msg("stopped avatar worker")
 
@@ -175,10 +225,23 @@ func consumeDeliveries(
 		if ctx.Err() != nil {
 			return nil
 		}
+		// Prioritize an overdue heartbeat over another ready delivery so a busy
+		// queue cannot starve the watchdog indefinitely.
+		select {
+		case <-heartbeat:
+			if err := updateWorkerHeartbeat(updateHeartbeat); err != nil {
+				return err
+			}
+		default:
+		}
 
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-heartbeat:
+			if err := updateWorkerHeartbeat(updateHeartbeat); err != nil {
+				return err
+			}
 		case delivery, ok := <-resizeDeliveries:
 			if ctx.Err() != nil {
 				if !ok {
@@ -265,6 +328,17 @@ func consumeDeliveries(
 			)
 		}
 	}
+}
+
+func updateWorkerHeartbeat(update func() error) error {
+	if update == nil {
+		return errors.New("worker heartbeat updater is not configured")
+	}
+	if err := update(); err != nil {
+		return fmt.Errorf("failed to update worker heartbeat: %w", err)
+	}
+
+	return nil
 }
 
 func newGracefulProcessingContext(
