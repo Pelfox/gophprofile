@@ -10,6 +10,7 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"path"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,9 +27,10 @@ import (
 )
 
 const (
-	consumerPrefetch     = 1
-	thumbnailContentType = "image/jpeg"
-	thumbnailQuality     = 90
+	consumerPrefetch        = 1
+	thumbnailContentType    = "image/jpeg"
+	thumbnailQuality        = 90
+	gracefulShutdownTimeout = 25 * time.Second
 
 	// Worker metric label values are intentionally low-cardinality.
 	workerJobResize         = "resize"
@@ -60,6 +62,15 @@ func Run(
 	logger zerolog.Logger,
 	cfg *config.WorkerConfig,
 ) error {
+	if err := removeWorkerHeartbeat(workerHealthFilePath); err != nil {
+		return err
+	}
+	defer func() {
+		if err := removeWorkerHeartbeat(workerHealthFilePath); err != nil {
+			logger.Error().Err(err).Msg("failed to clean up worker heartbeat")
+		}
+	}()
+
 	conn, err := amqp.Dial(cfg.RabbitMQURL)
 	if err != nil {
 		return fmt.Errorf("failed to connect to RabbitMQ: %w", err)
@@ -139,17 +150,113 @@ func consumeQueues(
 		return fmt.Errorf("failed to consume delete queue: %w", err)
 	}
 
+	processingCtx, stopProcessing := newGracefulProcessingContext(
+		ctx,
+		logger,
+		gracefulShutdownTimeout,
+	)
+	defer stopProcessing()
+
+	updateHeartbeat := func() error {
+		if conn.IsClosed() {
+			return errors.New("rabbitmq connection is closed")
+		}
+		if channel.IsClosed() {
+			return errors.New("rabbitmq consumer channel is closed")
+		}
+
+		return writeWorkerHeartbeat(workerHealthFilePath, time.Now())
+	}
+	if err := updateHeartbeat(); err != nil {
+		return fmt.Errorf("failed to initialize worker heartbeat: %w", err)
+	}
+
+	heartbeatTicker := time.NewTicker(workerHeartbeatInterval)
+	defer heartbeatTicker.Stop()
+
+	return consumeDeliveriesWithHeartbeat(
+		ctx,
+		processingCtx,
+		logger,
+		resizeDeliveries,
+		deleteDeliveries,
+		processor,
+		heartbeatTicker.C,
+		updateHeartbeat,
+	)
+}
+
+func consumeDeliveries(
+	ctx context.Context,
+	processingCtx context.Context,
+	logger zerolog.Logger,
+	resizeDeliveries <-chan amqp.Delivery,
+	deleteDeliveries <-chan amqp.Delivery,
+	processor *processor,
+) error {
+	return consumeDeliveriesWithHeartbeat(
+		ctx,
+		processingCtx,
+		logger,
+		resizeDeliveries,
+		deleteDeliveries,
+		processor,
+		nil,
+		nil,
+	)
+}
+
+func consumeDeliveriesWithHeartbeat(
+	ctx context.Context,
+	processingCtx context.Context,
+	logger zerolog.Logger,
+	resizeDeliveries <-chan amqp.Delivery,
+	deleteDeliveries <-chan amqp.Delivery,
+	processor *processor,
+	heartbeat <-chan time.Time,
+	updateHeartbeat func() error,
+) error {
 	logger.Info().Msg("started avatar worker")
+	defer logger.Info().Msg("stopped avatar worker")
+
 	for {
+		// Check before selecting so a ready delivery cannot keep the worker busy
+		// after shutdown has started.
+		if ctx.Err() != nil {
+			return nil
+		}
+		// Prioritize an overdue heartbeat over another ready delivery so a busy
+		// queue cannot starve the watchdog indefinitely.
+		select {
+		case <-heartbeat:
+			if err := updateWorkerHeartbeat(updateHeartbeat); err != nil {
+				return err
+			}
+		default:
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-heartbeat:
+			if err := updateWorkerHeartbeat(updateHeartbeat); err != nil {
+				return err
+			}
 		case delivery, ok := <-resizeDeliveries:
+			if ctx.Err() != nil {
+				if !ok {
+					return nil
+				}
+				return requeueDeliveryOnShutdown(delivery)
+			}
 			if !ok {
 				return errors.New("resize queue consumer closed")
 			}
 
-			deliveryCtx := extractDeliveryContext(ctx, delivery.Headers)
+			deliveryCtx := extractDeliveryContext(
+				processingCtx,
+				delivery.Headers,
+			)
 			jobStart := time.Now()
 			if err := processor.processResize(deliveryCtx, delivery.Body); err != nil {
 				observability.ObserveWorkerJob(
@@ -158,7 +265,7 @@ func consumeQueues(
 					time.Since(jobStart),
 				)
 				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to process resize job")
-				if err := rejectDelivery(delivery, err); err != nil {
+				if err := rejectDelivery(deliveryCtx, delivery, err); err != nil {
 					return err
 				}
 				continue
@@ -178,11 +285,20 @@ func consumeQueues(
 				time.Since(jobStart),
 			)
 		case delivery, ok := <-deleteDeliveries:
+			if ctx.Err() != nil {
+				if !ok {
+					return nil
+				}
+				return requeueDeliveryOnShutdown(delivery)
+			}
 			if !ok {
 				return errors.New("delete queue consumer closed")
 			}
 
-			deliveryCtx := extractDeliveryContext(ctx, delivery.Headers)
+			deliveryCtx := extractDeliveryContext(
+				processingCtx,
+				delivery.Headers,
+			)
 			jobStart := time.Now()
 			if err := processor.processDelete(deliveryCtx, delivery.Body); err != nil {
 				observability.ObserveWorkerJob(
@@ -191,7 +307,7 @@ func consumeQueues(
 					time.Since(jobStart),
 				)
 				logger.Error().Ctx(deliveryCtx).Err(err).Msg("failed to process delete job")
-				if err := rejectDelivery(delivery, err); err != nil {
+				if err := rejectDelivery(deliveryCtx, delivery, err); err != nil {
 					return err
 				}
 				continue
@@ -212,6 +328,68 @@ func consumeQueues(
 			)
 		}
 	}
+}
+
+func updateWorkerHeartbeat(update func() error) error {
+	if update == nil {
+		return errors.New("worker heartbeat updater is not configured")
+	}
+	if err := update(); err != nil {
+		return fmt.Errorf("failed to update worker heartbeat: %w", err)
+	}
+
+	return nil
+}
+
+func newGracefulProcessingContext(
+	ctx context.Context,
+	logger zerolog.Logger,
+	timeout time.Duration,
+) (context.Context, func()) {
+	processingCtx, cancelProcessing := context.WithCancel(
+		context.WithoutCancel(ctx),
+	)
+	done := make(chan struct{})
+	var stopOnce sync.Once
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			logger.Info().
+				Dur("timeout", timeout).
+				Msg("shutdown requested; draining current worker job")
+
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+
+			select {
+			case <-timer.C:
+				logger.Warn().
+					Dur("timeout", timeout).
+					Msg("worker drain timeout reached; canceling current job")
+				cancelProcessing()
+			case <-done:
+			}
+		case <-done:
+		}
+	}()
+
+	stop := func() {
+		stopOnce.Do(func() {
+			close(done)
+			cancelProcessing()
+		})
+	}
+
+	return processingCtx, stop
+}
+
+func requeueDeliveryOnShutdown(delivery amqp.Delivery) error {
+	if err := delivery.Nack(false, true); err != nil {
+		return fmt.Errorf("failed to requeue job during shutdown: %w", err)
+	}
+
+	return nil
 }
 
 func declareQueue(channel *amqp.Channel, name string) (amqp.Queue, error) {
@@ -237,8 +415,13 @@ func extractDeliveryContext(ctx context.Context, headers amqp.Table) context.Con
 	)
 }
 
-func rejectDelivery(delivery amqp.Delivery, err error) error {
-	requeue := errors.Is(err, context.Canceled) ||
+func rejectDelivery(
+	ctx context.Context,
+	delivery amqp.Delivery,
+	err error,
+) error {
+	requeue := ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded)
 	if nackErr := delivery.Nack(false, requeue); nackErr != nil {
 		return fmt.Errorf("failed to reject job: %w", nackErr)

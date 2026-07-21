@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +14,19 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+			if err := worker.CheckHealth(); err != nil {
+				_, _ = fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		}
+
+		_, _ = fmt.Fprintln(os.Stderr, "usage: worker [healthcheck]")
+		os.Exit(2)
+	}
+
 	logger := observability.NewLogger(os.Stdout)
 
 	cfg, err := config.LoadWorkerConfig()

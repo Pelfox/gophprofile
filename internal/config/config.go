@@ -10,7 +10,7 @@ import (
 // AppConfig stores application settings loaded from the environment.
 type AppConfig struct {
 	// ListenAddr is the address the HTTP server listens on.
-	ListenAddr string `env:"LISTEN_ADDR"`
+	ListenAddr string `env:"LISTEN_ADDR" env-default:":8080"`
 	// RabbitMQURL is the connection URL for RabbitMQ.
 	RabbitMQURL string `env:"RABBITMQ_URL"`
 	// DatabaseURL is the database connection URL.

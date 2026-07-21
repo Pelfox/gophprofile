@@ -10,11 +10,14 @@ import (
 	"image/jpeg"
 	"image/png"
 	"slices"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
 )
 
@@ -81,6 +84,68 @@ type fakeQueue struct {
 	resizeDoneErr error
 }
 
+type blockingDeleteStorage struct {
+	fakeStorage
+
+	started  chan struct{}
+	release  chan struct{}
+	canceled chan struct{}
+	calls    atomic.Int32
+}
+
+func (s *blockingDeleteStorage) Delete(ctx context.Context, _ []string) error {
+	if s.calls.Add(1) == 1 {
+		close(s.started)
+	}
+
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		select {
+		case s.canceled <- struct{}{}:
+		default:
+		}
+		return ctx.Err()
+	}
+}
+
+type nackRecord struct {
+	tag     uint64
+	requeue bool
+}
+
+type recordingAcknowledger struct {
+	acked  chan uint64
+	nacked chan nackRecord
+}
+
+func newRecordingAcknowledger() *recordingAcknowledger {
+	return &recordingAcknowledger{
+		acked:  make(chan uint64, 2),
+		nacked: make(chan nackRecord, 2),
+	}
+}
+
+func (a *recordingAcknowledger) Ack(tag uint64, _ bool) error {
+	a.acked <- tag
+	return nil
+}
+
+func (a *recordingAcknowledger) Nack(
+	tag uint64,
+	_ bool,
+	requeue bool,
+) error {
+	a.nacked <- nackRecord{tag: tag, requeue: requeue}
+	return nil
+}
+
+func (a *recordingAcknowledger) Reject(tag uint64, requeue bool) error {
+	a.nacked <- nackRecord{tag: tag, requeue: requeue}
+	return nil
+}
+
 func (q *fakeQueue) RequestResize(
 	ctx context.Context,
 	message pkg.MessageResizeRequest,
@@ -107,6 +172,217 @@ func (q *fakeQueue) CompleteResize(
 
 func (q *fakeQueue) Close() error {
 	return nil
+}
+
+func TestConsumeDeliveriesFinishesCurrentJobOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	processingCtx, stopProcessing := newGracefulProcessingContext(
+		ctx,
+		zerolog.Nop(),
+		time.Second,
+	)
+	defer stopProcessing()
+
+	storageProvider := &blockingDeleteStorage{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}, 1),
+	}
+	processor := &processor{
+		logger:  zerolog.Nop(),
+		queue:   &fakeQueue{},
+		storage: storageProvider,
+	}
+	acknowledger := newRecordingAcknowledger()
+	resizeDeliveries := make(chan amqp.Delivery)
+	deleteDeliveries := make(chan amqp.Delivery, 2)
+	deleteDeliveries <- testDeleteDelivery(t, acknowledger, 1)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- consumeDeliveries(
+			ctx,
+			processingCtx,
+			zerolog.Nop(),
+			resizeDeliveries,
+			deleteDeliveries,
+			processor,
+		)
+	}()
+
+	waitForSignal(t, storageProvider.started, "current job to start")
+	cancel()
+	deleteDeliveries <- testDeleteDelivery(t, acknowledger, 2)
+
+	select {
+	case <-storageProvider.canceled:
+		t.Fatal("current job context was canceled before the drain timeout")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(storageProvider.release)
+	select {
+	case tag := <-acknowledger.acked:
+		if tag != 1 {
+			t.Fatalf("expected delivery 1 to be acknowledged, got %d", tag)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for current job acknowledgement")
+	}
+
+	if err := waitForResult(t, result); err != nil {
+		t.Fatalf("consumeDeliveries returned error: %v", err)
+	}
+	if got := storageProvider.calls.Load(); got != 1 {
+		t.Fatalf("expected one processed job, got %d", got)
+	}
+	if got := len(deleteDeliveries); got != 1 {
+		t.Fatalf("expected the next job to remain unprocessed, got queue length %d", got)
+	}
+}
+
+func TestConsumeDeliveriesRequeuesCurrentJobAfterDrainTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	processingCtx, stopProcessing := newGracefulProcessingContext(
+		ctx,
+		zerolog.Nop(),
+		10*time.Millisecond,
+	)
+	defer stopProcessing()
+
+	storageProvider := &blockingDeleteStorage{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}, 1),
+	}
+	processor := &processor{
+		logger:  zerolog.Nop(),
+		queue:   &fakeQueue{},
+		storage: storageProvider,
+	}
+	acknowledger := newRecordingAcknowledger()
+	deleteDeliveries := make(chan amqp.Delivery, 1)
+	deleteDeliveries <- testDeleteDelivery(t, acknowledger, 1)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- consumeDeliveries(
+			ctx,
+			processingCtx,
+			zerolog.Nop(),
+			make(chan amqp.Delivery),
+			deleteDeliveries,
+			processor,
+		)
+	}()
+
+	waitForSignal(t, storageProvider.started, "current job to start")
+	cancel()
+	waitForSignal(t, storageProvider.canceled, "current job context cancellation")
+
+	select {
+	case record := <-acknowledger.nacked:
+		if record.tag != 1 || !record.requeue {
+			t.Fatalf("expected delivery 1 to be requeued, got %#v", record)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for current job requeue")
+	}
+
+	if err := waitForResult(t, result); err != nil {
+		t.Fatalf("consumeDeliveries returned error: %v", err)
+	}
+}
+
+func TestConsumeDeliveriesUpdatesHeartbeatWhileIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	heartbeat := make(chan time.Time, 1)
+	updated := make(chan struct{}, 1)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- consumeDeliveriesWithHeartbeat(
+			ctx,
+			ctx,
+			zerolog.Nop(),
+			make(chan amqp.Delivery),
+			make(chan amqp.Delivery),
+			&processor{},
+			heartbeat,
+			func() error {
+				updated <- struct{}{}
+				return nil
+			},
+		)
+	}()
+
+	heartbeat <- time.Now()
+	waitForSignal(t, updated, "worker heartbeat update")
+	cancel()
+
+	if err := waitForResult(t, result); err != nil {
+		t.Fatalf("consumeDeliveriesWithHeartbeat returned error: %v", err)
+	}
+}
+
+func TestConsumeDeliveriesDoesNotUpdateHeartbeatDuringJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	storageProvider := &blockingDeleteStorage{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}, 1),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(storageProvider.release)
+		}
+	}()
+
+	heartbeat := make(chan time.Time, 1)
+	updated := make(chan struct{}, 1)
+	deleteDeliveries := make(chan amqp.Delivery, 1)
+	deleteDeliveries <- testDeleteDelivery(t, newRecordingAcknowledger(), 1)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- consumeDeliveriesWithHeartbeat(
+			ctx,
+			context.Background(),
+			zerolog.Nop(),
+			make(chan amqp.Delivery),
+			deleteDeliveries,
+			&processor{
+				logger:  zerolog.Nop(),
+				queue:   &fakeQueue{},
+				storage: storageProvider,
+			},
+			heartbeat,
+			func() error {
+				updated <- struct{}{}
+				return nil
+			},
+		)
+	}()
+
+	waitForSignal(t, storageProvider.started, "current job to start")
+	heartbeat <- time.Now()
+	select {
+	case <-updated:
+		t.Fatal("heartbeat was updated while the current job was blocked")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cancel()
+	close(storageProvider.release)
+	released = true
+	if err := waitForResult(t, result); err != nil {
+		t.Fatalf("consumeDeliveriesWithHeartbeat returned error: %v", err)
+	}
 }
 
 func TestProcessorProcessResizeCreatesThumbnailsAndPublishesCompletion(
@@ -439,6 +715,45 @@ func newTestProcessor(queueProvider *fakeQueue, storageProvider *fakeStorage) *p
 		logger:  zerolog.Nop(),
 		queue:   queueProvider,
 		storage: storageProvider,
+	}
+}
+
+func testDeleteDelivery(
+	t *testing.T,
+	acknowledger amqp.Acknowledger,
+	tag uint64,
+) amqp.Delivery {
+	t.Helper()
+
+	return amqp.Delivery{
+		Acknowledger: acknowledger,
+		DeliveryTag:  tag,
+		Body: jsonPayload(t, pkg.MessageDeleteRequest{
+			ID:   uuid.MustParse("22222222-2222-2222-2222-222222222222"),
+			Keys: []string{"avatars/source/original.png"},
+		}),
+	}
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitForResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for worker to stop")
+		return nil
 	}
 }
 

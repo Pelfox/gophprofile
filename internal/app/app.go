@@ -12,9 +12,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/httprate"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/controllers"
+	"github.com/pelfox/gophprofile/internal/healthcheck"
 	"github.com/pelfox/gophprofile/internal/observability"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
@@ -27,7 +30,15 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
-const shutdownTimeout = 10 * time.Second
+const (
+	shutdownTimeout = 10 * time.Second
+
+	apiRateLimitRequests    = 10
+	apiRateLimitWindow      = time.Second
+	uploadRateLimitRequests = 5
+	uploadRateLimitWindow   = time.Minute
+	trustedClientIPHeader   = "X-Real-IP"
+)
 
 // Run starts the application with the given logger and configuration.
 func Run(
@@ -83,8 +94,14 @@ func Run(
 	)
 
 	server := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: newRouter(avatarsController, metricsHandler),
+		Addr: cfg.ListenAddr,
+		Handler: newRouter(
+			avatarsController,
+			metricsHandler,
+			healthcheck.NewHandler(pool, conn),
+			newClientIPRateLimit(apiRateLimitRequests, apiRateLimitWindow),
+			newClientIPRateLimit(uploadRateLimitRequests, uploadRateLimitWindow),
+		),
 	}
 
 	errCh := make(chan error, 2)
@@ -114,8 +131,17 @@ func Run(
 func newRouter(
 	avatarsController *controllers.AvatarsController,
 	metricsHandler http.Handler,
+	healthHandler *healthcheck.Handler,
+	apiRateLimit func(http.Handler) http.Handler,
+	uploadRateLimit func(http.Handler) http.Handler,
 ) http.Handler {
 	router := chi.NewRouter()
+
+	// X-Real-IP is trusted because the Kubernetes Ingress overwrites it and
+	// NetworkPolicy prevents clients from connecting to the API directly.
+	// RemoteAddr remains the fallback for direct local development.
+	router.Use(middleware.ClientIPFromRemoteAddr)
+	router.Use(middleware.ClientIPFromHeader(trustedClientIPHeader))
 
 	// Adding Prometheus request metrics before route handlers run.
 	router.Use(observability.HTTPMetricsMiddleware)
@@ -127,11 +153,14 @@ func newRouter(
 
 	// Exposing process and custom application metrics for Prometheus.
 	router.Handle("/metrics", metricsHandler)
+	router.Get("/health/live", healthHandler.Liveness)
+	router.Get("/health/ready", healthHandler.Readiness)
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})
 	router.Route("/api/v1", func(router chi.Router) {
-		router.Post("/avatars", avatarsController.Upload)
+		router.Use(apiRateLimit)
+		router.With(uploadRateLimit).Post("/avatars", avatarsController.Upload)
 		router.Get("/avatars/{avatarID}", avatarsController.GetByID)
 		router.Get("/avatars/{avatarID}/metadata", avatarsController.GetMetadata)
 		router.Delete("/avatars/{avatarID}", avatarsController.Delete)
@@ -139,6 +168,28 @@ func newRouter(
 	})
 
 	return router
+}
+
+func newClientIPRateLimit(
+	requestLimit int,
+	windowLength time.Duration,
+) func(http.Handler) http.Handler {
+	return httprate.LimitBy(
+		requestLimit,
+		windowLength,
+		func(r *http.Request) (string, error) {
+			clientIP := middleware.GetClientIP(r.Context())
+			return httprate.CanonicalizeIP(clientIP), nil
+		},
+		httprate.WithLimitHandler(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			controllers.WriteError(
+				w,
+				http.StatusTooManyRequests,
+				"Too many requests.",
+			)
+		}),
+	)
 }
 
 func consumeResizeDoneQueue(

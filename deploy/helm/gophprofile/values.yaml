@@ -1,0 +1,207 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/pelfox/gophprofile
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+
+config:
+  create: true
+  existingConfigMap: ""
+  s3Region: us-east-1
+  s3Endpoint: "..."
+  s3Bucket: gophprofile
+  telemetryEndpoint: "..."
+  extraData: {}
+
+secret:
+  create: false
+  existingSecret: gophprofile-secret
+  data:
+    databaseURL: "..."
+    rabbitmqURL: "..."
+    s3AccessKey: "..."
+    s3SecretKey: "..."
+  extraData: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+tmpVolume:
+  sizeLimit: 64Mi
+
+api:
+  replicaCount: 2
+  terminationGracePeriodSeconds: 30
+  podAnnotations: {}
+  podLabels: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  startupProbe:
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+  livenessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readinessProbe:
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+          - type: Pods
+            value: 4
+            periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        selectPolicy: Min
+        policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+          - type: Pods
+            value: 1
+            periodSeconds: 60
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+worker:
+  replicaCount: 1
+  terminationGracePeriodSeconds: 30
+  podAnnotations: {}
+  podLabels: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  startupProbe:
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+  livenessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readinessProbe:
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+          - type: Pods
+            value: 2
+            periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        selectPolicy: Min
+        policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+          - type: Pods
+            value: 1
+            periodSeconds: 60
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+  internalTrafficPolicy: Cluster
+  sessionAffinity: None
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/load-balance: round_robin
+  hosts:
+    - host: ...
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  additionalLabels: {}
+  interval: 30s
+  scrapeTimeout: 10s
+
+networkPolicy:
+  enabled: true
+  apiIngressNamespaces:
+    - ingress-nginx
+    - monitoring
+  dnsEgressPorts:
+    - 53
+  apiEgressPorts:
+    - 80
+    - 443
+    - 4318
+    - 5432
+    - 5671
+    - 5672
+    - 9000
+  workerEgressPorts:
+    - 80
+    - 443
+    - 4318
+    - 5671
+    - 5672
+    - 9000
